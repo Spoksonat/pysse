@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysse"
+version = "0.1.0"
+description = "Stochastic Schrodinger equation simulations with pulse modeling."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Manuel Fernando Sanchez Alarcon" }
+]
+dependencies = [
+  "numpy>=2.3.0",
+  "scipy>=1.16.0",
+  "matplotlib>=3.10.0",
+  "ipykernel>=7.0.0",
+]
+
+[project.optional-dependencies]
+docs = [
+  "sphinx>=8.0.0",
+  "furo>=2024.8.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

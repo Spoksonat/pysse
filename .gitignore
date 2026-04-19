@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+pysse_env/
+
+# Notebook and test artifacts
+.ipynb_checkpoints/
+artifacts/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Documentation build
+docs/_build/
+
+# macOS
+.DS_Store
