@@ -7,8 +7,10 @@ Requirements
 - Python 3.10 or newer.
 - ``pip`` available in your environment.
 
-Standard install
-----------------
+Install
+-------
+
+From the repository root:
 
 .. code-block:: bash
 
@@ -16,12 +18,20 @@ Standard install
    source pysse_env/bin/activate
    pip install --upgrade pip
    pip install -r requirements.txt
+   pip install -e .
 
-Editable install
-----------------
+The editable install registers ``pysse`` in your environment. Without it,
+imports such as ``from pysse import SSE`` will fail in notebooks and scripts.
 
-If you want to import the package directly from source:
+Documentation dependencies
+--------------------------
+
+To build the HTML documentation locally:
 
 .. code-block:: bash
 
-   pip install -e .
+   pip install -e ".[docs]"
+   cd docs
+   make clean html
+
+See the :doc:`quickstart` page for the runtime workflow after installation.
