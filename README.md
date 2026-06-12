@@ -64,11 +64,18 @@ Build docs locally with:
 
 ```bash
 cd docs
-sphinx-build -b html . _build/html
+make clean html
+open _build/html/index.html
 ```
+
+If you add or rename ``.rst`` pages, run ``make clean html`` so Sphinx does
+not reuse a stale cached environment (incremental builds may skip new files).
+
+Online docs: https://spoksonat.github.io/pysse/
 
 Documentation includes:
 
+- notebook examples in `notebooks/` (`examples.rst`),
 - mathematical model used by `SSE` in `class_sse.py`,
 - pulse-modeling section for `ElectricFieldPulse` in `class_field.py`,
 - API reference generated from docstrings.
