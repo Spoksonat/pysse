@@ -4,7 +4,7 @@ Pulse Modeling in ``class_field.py``
 Overview
 --------
 
-``Electric_Field_Pulse`` creates time-domain pulses and computes their spectral
+``ElectricFieldPulse`` creates time-domain pulses and computes their spectral
 representation for later use in ``SSE`` propagation.
 
 Physical conversions

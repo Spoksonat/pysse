@@ -70,5 +70,5 @@ sphinx-build -b html . _build/html
 Documentation includes:
 
 - mathematical model used by `SSE` in `class_sse.py`,
-- pulse-modeling section for `Electric_Field_Pulse` in `class_field.py`,
+- pulse-modeling section for `ElectricFieldPulse` in `class_field.py`,
 - API reference generated from docstrings.
