@@ -39,18 +39,18 @@ PySSE/
 
 ## Quick start
 
+From the repository root:
+
 ```bash
 python3 -m venv pysse_env
 source pysse_env/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-```
-
-Optional editable install:
-
-```bash
 pip install -e .
 ```
+
+The editable install registers the `pysse` package in your environment so
+notebooks and scripts can use `from pysse import SSE, ElectricFieldPulse`.
 
 ## Data policy
 
