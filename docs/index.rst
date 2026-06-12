@@ -13,6 +13,7 @@ This documentation combines conceptual sections and API references for:
    quickstart
    installation
    usage
+   examples
    sse_model
    field_model
    api
