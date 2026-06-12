@@ -17,7 +17,7 @@ class ElectricFieldPulse:
         e_window: float | None = None,
         pulse_width: float | None = None,
         crossing_threshold: float | None = None,
-        time_span: float = 4000,
+        time_span: float = 8,
     ) -> None:
         """Initialize a pulse model and compute its spectral characteristics.
 
