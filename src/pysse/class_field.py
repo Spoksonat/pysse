@@ -3,8 +3,6 @@
 import numpy as np
 from scipy.signal import find_peaks
 
-from .class_utils import SpectrumUtils
-
 
 class ElectricFieldPulse:
     """Build and characterize driving electric pulses in atomic units."""
@@ -16,7 +14,6 @@ class ElectricFieldPulse:
         pulse_type: str = "gaussian",
         fwhm: float | None = None,
         omega_sin: float | None = None,
-        phase_sin: float = 0,
         e_window: float | None = None,
         pulse_width: float | None = None,
         crossing_threshold: float | None = None,
@@ -65,7 +62,7 @@ class ElectricFieldPulse:
             if pulse_width is not None
             else None
         )
-        self.phase_sin = phase_sin
+
         self.e_max = self.convert_i_to_emax(self.intensity)
         self.sigma = self.convert_fwhm_to_sigma(self.fwhm) if self.fwhm is not None else None
         if pulse_type != "sinc":
@@ -89,7 +86,6 @@ class ElectricFieldPulse:
                 self.e_max,
                 self.sigma,
                 self.omega_sin,
-                self.phase_sin,
                 self.t_0,
                 self.time,
             )
@@ -168,7 +164,6 @@ class ElectricFieldPulse:
         e_max: float,
         sigma: float,
         omega_c: float,
-        phase_sin: float,
         t_0: float,
         time_array: np.ndarray,
     ) -> None:
@@ -187,8 +182,8 @@ class ElectricFieldPulse:
         time_array : numpy.ndarray
             Time grid where the pulse is evaluated.
         """
-        self.pulse = e_max * np.exp(-((time_array - t_0) ** 2) / (2 * sigma**2))* np.sin(
-            omega_c * time_array + phase_sin
+        self.pulse = e_max * np.exp(-((time_array - t_0) ** 2) / (2 * sigma**2)) * np.sin(
+            omega_c * time_array
         )
 
     def create_sinc_pulse(
@@ -239,7 +234,13 @@ class ElectricFieldPulse:
         magnitude : numpy.ndarray
             Absolute FFT magnitude of the pulse.
         """
-        self.freq, pulse_fft = SpectrumUtils.fft_pulse(self.time, self.pulse)
+        dt = self.time[1] - self.time[0]
+        n_points = len(self.time)
+        freq = np.fft.fftfreq(n_points, d=dt)
+        pulse_fft = np.fft.fft(self.pulse)
+        pulse_fft = np.fft.fftshift(pulse_fft)
+        freq = np.fft.fftshift(freq)
+        self.freq = 2 * np.pi * freq * self.conversion_factor_hartree_to_ev
         self.magnitude = np.abs(pulse_fft)
 
     def estimate_central_frequency(self, x: np.ndarray, y: np.ndarray) -> float:

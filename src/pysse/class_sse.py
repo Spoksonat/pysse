@@ -1,168 +1,223 @@
-"""Time-dependent Schrödinger equation (TDSE) solver implementation."""
+"""Stochastic Schrödinger equation (SSE) solver implementation."""
 
 import os
-import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
-_MOLECULAR_DATA_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-
-
 class SSE:
-    """Propagate amplitudes under i dC/dt = H(t) C(t)."""
+    """Solve open-system dynamics with stochastic trajectories."""
 
     def __init__(
         self,
         filepath: str,
         electric_field: dict,
+        gamma: np.ndarray,
         initial_conditions,
+        n_paths: int,
         propagation_method: str,
+        n_jobs: int = 1,
+        random_seed: int | None = None,
     ) -> None:
-        """Initialize the TDSE solver and propagate C(t).
+        """Initialize the SSE solver and precompute static matrices.
 
         Args:
             filepath: Directory containing ``ci_mut.inp`` and ``ci_energy.inp``.
             electric_field: Time-dependent field data with keys ``time``,
                 ``pulse_x``, ``pulse_y``, and ``pulse_z``.
+            gamma: Dissipation channels with rows
+                ``[final_state, initial_state, gamma]``.
             initial_conditions: Initial populations as ``[state, population]`` pairs.
+            n_paths: Number of stochastic trajectories for ensemble averages.
             propagation_method: One-step integrator, one of ``EM``, ``Heun``, ``RK4``.
+            n_jobs: Number of worker processes for trajectory parallelism.
+            random_seed: Base random seed for reproducible trajectory RNG streams.
         """
         self.filepath = Path(filepath)
         self.conversion_factor_hartree_to_eV = 27.2114
-        self.conversion_factor_eV_to_hartree = 1 / self.conversion_factor_hartree_to_eV
+        self.conversion_factor_eV_to_hartree = 1/self.conversion_factor_hartree_to_eV
         self.propagation_method = propagation_method
-        cache_key = str(self.filepath.resolve())
-        if cache_key in _MOLECULAR_DATA_CACHE:
-            self.matrix, self.energies = _MOLECULAR_DATA_CACHE[cache_key]
-        else:
-            self.matrix = self.load_electric_dipole_moment()
-            self.energies = self.load_energies()
-            _MOLECULAR_DATA_CACHE[cache_key] = (self.matrix, self.energies)
+        self.matrix = self.load_electric_dipole_moment()
+        self.energies = self.load_energies()
         self.n_states = len(self.energies)
         self.electric_field = electric_field
         self.time = self.electric_field["time"]
         self.n_t = len(self.time)
+        self.gamma = gamma
         self.initial_conditions = initial_conditions
         self.c_initial = self.get_c_initial()
         self.dt = self.time[1] - self.time[0]
+        self.sqrt_dt = np.sqrt(self.dt)
+        self.n_paths = n_paths
+        self.n_jobs = n_jobs
+        self.random_seed = random_seed
         self.H0 = np.diag(self.energies)
-        self.c_time = self.get_c_time()
-        self.population = np.abs(self.c_time) ** 2
-        self.population_average = self.population
-        self.population_std = np.zeros((self.n_t, self.n_states), dtype=float)
-        self.mu_t = self.get_mu_t()
+        self.gamma_matrix = self.get_gamma_matrix()
+        self.R_base = self.build_random_base_matrices()
+        self.idx_fixed, self.idx_active = self.get_normalization_indices(self.R_base)
+        self.population_average, self.population_std = self.get_population_average()
+
+    def _resolve_n_jobs(self):
+        """Return the effective number of worker processes.
+
+        Returns
+        -------
+        int
+            Number of processes to use, always at least 1.
+        """
+        n_jobs = os.cpu_count() if self.n_jobs in (None, 0, -1) else int(self.n_jobs)
+        return max(1, n_jobs)
+
+    def _build_worker_payloads(self):
+        """Build per-trajectory payloads for multiprocessing workers.
+
+        Returns
+        -------
+        list of dict
+            One serialized payload per trajectory with all data needed by workers.
+        """
+        n_t, n_s = self.n_t, self.n_states
+        seed_seq = np.random.SeedSequence(self.random_seed)
+        child_seeds = seed_seq.spawn(self.n_paths)
+        payloads = []
+        for i in range(self.n_paths):
+            payloads.append(
+                {
+                    "seed": int(child_seeds[i].generate_state(1)[0]),
+                    "n_t": n_t,
+                    "n_s": n_s,
+                    "dt": self.dt,
+                    "sqrt_dt": self.sqrt_dt,
+                    "method": self.propagation_method,
+                    "h0": self.H0,
+                    "gamma_matrix": self.gamma_matrix,
+                    "r_base": self.R_base,
+                    "idx_fixed": self.idx_fixed,
+                    "idx_active": self.idx_active,
+                    "c_initial": self.c_initial,
+                    "pulse_x": self.electric_field["pulse_x"],
+                    "pulse_y": self.electric_field["pulse_y"],
+                    "pulse_z": self.electric_field["pulse_z"],
+                    "mu_x": self.matrix[:, :, 0],
+                    "mu_y": self.matrix[:, :, 1],
+                    "mu_z": self.matrix[:, :, 2],
+                }
+            )
+        return payloads
 
     @staticmethod
-    def _normalize(coeffs: np.ndarray) -> np.ndarray:
-        """Renormalize the amplitude vector to unit norm.
+    def _apply_weighted_normalization(coeffs, idx_fixed, idx_active):
+        """Apply constrained normalization separating fixed and active subspaces.
 
         Parameters
         ----------
         coeffs : numpy.ndarray
-            Complex amplitude vector.
+            Complex amplitude vector to normalize.
+        idx_fixed : numpy.ndarray
+            Indices of states not directly affected by stochastic couplings.
+        idx_active : numpy.ndarray
+            Indices of states affected by stochastic couplings.
 
         Returns
         -------
         numpy.ndarray
             Normalized amplitude vector.
         """
-        norm = np.linalg.norm(coeffs)
-        if norm == 0:
-            return coeffs
-        return coeffs / norm
+        if (len(idx_fixed) > 0) and (len(idx_active) > 0):
+            p_fixed = np.sum(np.abs(coeffs[idx_fixed])**2)
+            p_active = np.sum(np.abs(coeffs[idx_active])**2)
+            if (p_active > 0) and (p_fixed <= 1.0):
+                scale_factor_numerator = np.max([1.0 - p_fixed, 0.0])
+                scale_factor_denominator = np.max([p_active, 1e-10])
+                scale_factor = np.sqrt(scale_factor_numerator / scale_factor_denominator)
+                coeffs[idx_active] = coeffs[idx_active] * scale_factor
+            else:
+                coeffs = coeffs / np.sqrt(np.sum(np.abs(coeffs)**2))
+        else:
+            coeffs = coeffs / np.sqrt(np.sum(np.abs(coeffs)**2))
+        return coeffs
 
     @staticmethod
-    def _build_hamiltonians(
-        h0: np.ndarray,
-        pulse_x: np.ndarray,
-        pulse_y: np.ndarray,
-        pulse_z: np.ndarray,
-        mu_x: np.ndarray,
-        mu_y: np.ndarray,
-        mu_z: np.ndarray,
-    ) -> np.ndarray:
-        """Build H(t) for all time steps.
-
-        Returns
-        -------
-        numpy.ndarray
-            Hamiltonian stack with shape ``(n_t, n_states, n_states)``.
-        """
-        interaction = -(
-            pulse_x[:, None, None] * mu_x
-            + pulse_y[:, None, None] * mu_y
-            + pulse_z[:, None, None] * mu_z
-        )
-        return h0 + interaction
-
-    @staticmethod
-    def _propagate_one_step(
-        method: str,
-        hn: np.ndarray,
-        c_previous: np.ndarray,
-        dt: float,
-    ) -> np.ndarray:
-        """Propagate one step of i dC/dt = H(t) C(t).
+    def _propagate_one_step(method, Hn, Rn, gamma_matrix, c_previous, dt, sqrt_dt):
+        """Propagate one stochastic step for the selected integration method.
 
         Parameters
         ----------
         method : {"EM", "Heun", "RK4"}
             Time-integration method.
-        hn : numpy.ndarray
-            Hamiltonian at the current time step.
+        Hn : numpy.ndarray
+            Total Hamiltonian at the current time step.
+        Rn : numpy.ndarray
+            Stochastic matrix sampled for the current step.
+        gamma_matrix : numpy.ndarray
+            Dissipation matrix.
         c_previous : numpy.ndarray
             Amplitudes at the previous step.
         dt : float
             Time-step size.
+        sqrt_dt : float
+            Square root of the time-step size.
 
         Returns
         -------
         numpy.ndarray
-            Amplitudes at the current step.
+            Unnormalized amplitudes at the current step.
 
         Raises
         ------
         ValueError
             If ``method`` is not one of ``"EM"``, ``"Heun"``, or ``"RK4"``.
         """
-        def rhs(coeffs: np.ndarray) -> np.ndarray:
-            return -1j * hn @ coeffs
-
         if method == "EM":
-            return c_previous + dt * rhs(c_previous)
+            dC = dt * (-1j * Hn - 0.5 * gamma_matrix) @ c_previous - 1j * sqrt_dt * Rn @ c_previous
+            return c_previous + dC
 
-        if method == "Heun":
-            k1 = rhs(c_previous)
-            k2 = rhs(c_previous + dt * k1)
-            return c_previous + 0.5 * dt * (k1 + k2)
+        elif method == "Heun":
+            f1_deterministic = (-1j * Hn - 0.5 * gamma_matrix) @ c_previous * dt
+            f1_stochastic = -1j * sqrt_dt * Rn @ c_previous
+            c_tilde = c_previous + f1_deterministic + f1_stochastic
+            f2_deterministic = (-1j * Hn - 0.5 * gamma_matrix) @ c_tilde * dt
+            f2_stochastic = -1j * sqrt_dt * Rn @ c_tilde
+            return c_previous + 0.5 * (f1_deterministic + f2_deterministic) + 0.5 * (f1_stochastic + f2_stochastic)
 
-        if method == "RK4":
-            k1 = rhs(c_previous)
-            k2 = rhs(c_previous + 0.5 * dt * k1)
-            k3 = rhs(c_previous + 0.5 * dt * k2)
-            k4 = rhs(c_previous + dt * k3)
-            return c_previous + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        elif method == "RK4":
+            def f_det(coeffs):
+                return (-1j * Hn - 0.5 * gamma_matrix) @ coeffs
 
-        raise ValueError(f"Invalid propagation method: {method}")
+            k1 = f_det(c_previous)
+            k2 = f_det(c_previous + (dt/2) * k1)
+            k3 = f_det(c_previous + (dt/2) * k2)
+            k4 = f_det(c_previous + dt * k3)
+            c_deterministic = c_previous + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+            c_stochastic = -1j * sqrt_dt * Rn @ c_deterministic
+            return c_deterministic + c_stochastic
+
+        else:
+            raise ValueError(f"Invalid propagation method: {method}")
 
     @staticmethod
     def _propagate_trajectory(
-        method: str,
-        h0: np.ndarray,
-        c_initial: np.ndarray,
-        pulse_x: np.ndarray,
-        pulse_y: np.ndarray,
-        pulse_z: np.ndarray,
-        mu_x: np.ndarray,
-        mu_y: np.ndarray,
-        mu_z: np.ndarray,
-        dt: float,
-        n_t: int,
-        n_s: int,
-    ) -> np.ndarray:
-        """Propagate one full trajectory of i dC/dt = H(t) C(t).
+        method,
+        h0,
+        gamma_matrix,
+        r_base,
+        idx_fixed,
+        idx_active,
+        c_initial,
+        pulse_x,
+        pulse_y,
+        pulse_z,
+        mu_x,
+        mu_y,
+        mu_z,
+        dt,
+        sqrt_dt,
+        n_t,
+        n_s,
+        draw_normal,
+    ):
+        """Propagate one full trajectory with a user-provided normal sampler.
 
         Parameters
         ----------
@@ -170,16 +225,24 @@ class SSE:
             Time-integration method.
         h0 : numpy.ndarray
             Field-free Hamiltonian matrix.
+        gamma_matrix : numpy.ndarray
+            Dissipation matrix.
+        r_base : numpy.ndarray
+            Base stochastic coupling matrix.
+        idx_fixed, idx_active : numpy.ndarray
+            Index partitions used for weighted normalization.
         c_initial : numpy.ndarray
             Initial amplitude vector.
         pulse_x, pulse_y, pulse_z : numpy.ndarray
             Electric-field components for each time step.
         mu_x, mu_y, mu_z : numpy.ndarray
             Dipole-coupling matrices.
-        dt : float
-            Time-step size.
+        dt, sqrt_dt : float
+            Time-step size and its square root.
         n_t, n_s : int
             Number of time points and number of states.
+        draw_normal : callable
+            Function receiving ``size=r_base.shape`` and returning a normal matrix.
 
         Returns
         -------
@@ -188,36 +251,88 @@ class SSE:
         """
         c_time = np.zeros((n_t, n_s), dtype=complex)
         c_time[0, :] = c_initial
-        h_all = SSE._build_hamiltonians(
-            h0, pulse_x, pulse_y, pulse_z, mu_x, mu_y, mu_z
-        )
-
-        if method == "RK4":
-            for i in range(1, n_t):
-                hn = h_all[i]
-                c_previous = c_time[i - 1, :]
-                k1 = -1j * hn @ c_previous
-                k2 = -1j * hn @ (c_previous + 0.5 * dt * k1)
-                k3 = -1j * hn @ (c_previous + 0.5 * dt * k2)
-                k4 = -1j * hn @ (c_previous + dt * k3)
-                c_actual = c_previous + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-                c_time[i, :] = SSE._normalize(c_actual)
-            return c_time
 
         for i in range(1, n_t):
-            hn = h_all[i]
+            hi = -(mu_x * pulse_x[i] + mu_y * pulse_y[i] + mu_z * pulse_z[i])
+            hn = h0 + hi
+            random_matrix = draw_normal(size=r_base.shape)
+            rn = r_base * random_matrix
             c_previous = c_time[i - 1, :]
             c_actual = SSE._propagate_one_step(
                 method=method,
-                hn=hn,
+                Hn=hn,
+                Rn=rn,
+                gamma_matrix=gamma_matrix,
                 c_previous=c_previous,
                 dt=dt,
+                sqrt_dt=sqrt_dt,
             )
-            c_time[i, :] = SSE._normalize(c_actual)
+            c_time[i, :] = SSE._apply_weighted_normalization(c_actual, idx_fixed, idx_active)
 
         return c_time
 
-    def load_electric_dipole_moment(self) -> np.ndarray:
+    @staticmethod
+    def _simulate_one_path(payload):
+        """Simulate one stochastic trajectory and return populations.
+
+        Parameters
+        ----------
+        payload : dict
+            Serialized data for a single trajectory simulation.
+
+        Returns
+        -------
+        numpy.ndarray
+            Population array with shape ``(n_t, n_states)`` equal to ``|C(t)|^2``.
+
+        Raises
+        ------
+        ValueError
+            If the propagation method is not one of ``"EM"``, ``"Heun"``, or ``"RK4"``.
+        """
+        rng = np.random.default_rng(payload["seed"])
+        n_t = payload["n_t"]
+        n_s = payload["n_s"]
+        dt = payload["dt"]
+        sqrt_dt = payload["sqrt_dt"]
+        method = payload["method"]
+        h0 = payload["h0"]
+        gamma_matrix = payload["gamma_matrix"]
+        r_base = payload["r_base"]
+        idx_fixed = payload["idx_fixed"]
+        idx_active = payload["idx_active"]
+        c_initial = payload["c_initial"]
+        pulse_x = payload["pulse_x"]
+        pulse_y = payload["pulse_y"]
+        pulse_z = payload["pulse_z"]
+        mu_x = payload["mu_x"]
+        mu_y = payload["mu_y"]
+        mu_z = payload["mu_z"]
+
+        c_time = SSE._propagate_trajectory(
+            method=method,
+            h0=h0,
+            gamma_matrix=gamma_matrix,
+            r_base=r_base,
+            idx_fixed=idx_fixed,
+            idx_active=idx_active,
+            c_initial=c_initial,
+            pulse_x=pulse_x,
+            pulse_y=pulse_y,
+            pulse_z=pulse_z,
+            mu_x=mu_x,
+            mu_y=mu_y,
+            mu_z=mu_z,
+            dt=dt,
+            sqrt_dt=sqrt_dt,
+            n_t=n_t,
+            n_s=n_s,
+            draw_normal=rng.normal,
+        )
+
+        return np.abs(c_time) ** 2
+
+    def load_electric_dipole_moment(self):
         """Load transition dipole moments into a symmetric tensor.
 
         Returns
@@ -248,11 +363,11 @@ class SSE:
         matrix = np.zeros((max_state + 1, max_state + 1, 3), dtype=float)
         for i_state, j_state, values in entries:
             matrix[i_state, j_state, :] = values
-            matrix[j_state, i_state, :] = values
+            matrix[j_state, i_state, :] = values # Symmetric matrix
 
         return matrix
 
-    def load_energies(self) -> np.ndarray:
+    def load_energies(self):
         """Load state energies and convert from eV to Hartree.
 
         Returns
@@ -268,6 +383,7 @@ class SSE:
                 if len(parts) < 4 or parts[0] != "Root":
                     continue
 
+                # Reserve index 0 for ground-state energy (= 0.0).
                 root_idx = int(parts[1])
                 energy = float(parts[3])
                 entries.append((root_idx, energy))
@@ -278,7 +394,26 @@ class SSE:
         energies = energies * self.conversion_factor_eV_to_hartree
         return energies
 
-    def get_c_initial(self) -> np.ndarray:
+    def build_random_base_matrices(self):
+        """Build the base stochastic coupling matrix from ``gamma`` transitions.
+
+        Returns
+        -------
+        numpy.ndarray
+            Matrix of coupling prefactors used to generate random stochastic matrices.
+        """
+        R_matrix = np.zeros((self.n_states, self.n_states))
+
+        for i in range(len(self.gamma)):
+            final_state = int(self.gamma[i, 0])
+            initial_state = int(self.gamma[i, 1])
+            gamma = self.gamma[i, 2]
+
+            R_matrix[final_state, initial_state] = np.sqrt(gamma)
+
+        return R_matrix
+
+    def get_c_initial(self):
         """Build the initial complex amplitude vector from populations.
 
         Returns
@@ -292,11 +427,64 @@ class SSE:
             state = int(self.initial_conditions[i][0])
             coefficient = np.sqrt(self.initial_conditions[i][1])
             c_initial[state] = coefficient
-
+        
+        # c_initial = c_initial / np.sqrt(np.linalg.norm(c_initial))
         return c_initial
 
-    def get_c_time(self) -> np.ndarray:
-        """Propagate amplitudes under i dC/dt = H(t) C(t).
+    def get_gamma_matrix(self):
+        """Build the diagonal decay/dephasing matrix from ``gamma`` channels.
+
+        Returns
+        -------
+        numpy.ndarray
+            Diagonal matrix with total outgoing rate per initial state.
+        """
+        gamma_matrix = np.zeros((self.n_states, self.n_states))
+        initial_states = self.gamma[:, 1].astype(int)
+        rates = self.gamma[:, 2]
+        np.add.at(gamma_matrix, (initial_states, initial_states), rates)
+
+        return gamma_matrix
+
+    def get_normalization_indices(self, R_matrix):
+        """Split states into fixed and active sets for weighted normalization.
+
+        Parameters
+        ----------
+        R_matrix : numpy.ndarray
+            Base stochastic coupling matrix.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            ``(idx_fixed, idx_active)`` indices used by normalization.
+        """
+        idx_fixed = []
+        idx_active = []
+        for i in range(self.n_states):
+            if np.all(R_matrix[i,:] == 0): # and np.all(R_matrix[:,i] == 0):
+                idx_fixed.append(i)
+            else:
+                idx_active.append(i)
+        return np.array(idx_fixed), np.array(idx_active)
+
+    def weighted_normalization(self, coeffs):
+        """Normalize amplitudes using the precomputed active/fixed partition.
+
+        Parameters
+        ----------
+        coeffs : numpy.ndarray
+            Complex amplitude vector to normalize.
+
+        Returns
+        -------
+        numpy.ndarray
+            Normalized amplitude vector.
+        """
+        return SSE._apply_weighted_normalization(coeffs, self.idx_fixed, self.idx_active)
+
+    def get_c_time(self):
+        """Propagate one full stochastic trajectory of amplitudes.
 
         Returns
         -------
@@ -310,10 +498,15 @@ class SSE:
         """
         if self.propagation_method not in {"RK4", "Heun", "EM"}:
             raise ValueError(f"Invalid propagation method: {self.propagation_method}")
+        method = self.propagation_method
 
         return SSE._propagate_trajectory(
-            method=self.propagation_method,
+            method=method,
             h0=self.H0,
+            gamma_matrix=self.gamma_matrix,
+            r_base=self.R_base,
+            idx_fixed=self.idx_fixed,
+            idx_active=self.idx_active,
             c_initial=self.c_initial,
             pulse_x=self.electric_field["pulse_x"],
             pulse_y=self.electric_field["pulse_y"],
@@ -322,175 +515,48 @@ class SSE:
             mu_y=self.matrix[:, :, 1],
             mu_z=self.matrix[:, :, 2],
             dt=self.dt,
+            sqrt_dt=self.sqrt_dt,
             n_t=self.n_t,
             n_s=self.n_states,
+            draw_normal=np.random.normal,
         )
 
-    def get_mu_t(self) -> np.ndarray:
-        """Get the time-dependent dipole-coupling matrix."""
-        return np.einsum(
-            "tj,ti,ijk->kt",
-            np.conj(self.c_time),
-            self.c_time,
-            self.matrix,
-            optimize=True,
-        )
+    def get_population_average(self):
+        """Compute mean population and standard error over trajectories.
 
+        Returns
+        -------
+        tuple of numpy.ndarray
+            ``(population_average, population_std)`` where ``population_std`` is the
+            standard error of the mean.
+        """
+        n_t, n_s = self.n_t, self.n_states
+        population_sum = np.zeros((n_t, n_s), dtype=float)
+        population_sq_sum = np.zeros((n_t, n_s), dtype=float)
+        n_jobs = self._resolve_n_jobs()
 
-def _init_parallel_worker(src_path: str | None) -> None:
-    """Ensure worker processes can import ``pysse`` from ``src_path``."""
-    if src_path and src_path not in sys.path:
-        sys.path.insert(0, src_path)
+        if n_jobs == 1:
+            if self.random_seed is not None:
+                np.random.seed(self.random_seed)
+            for _ in range(self.n_paths):
+                pop = np.abs(self.get_c_time()) ** 2
+                population_sum += pop
+                population_sq_sum += pop ** 2
+        else:
+            payloads = self._build_worker_payloads()
 
+            with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+                for pop in executor.map(SSE._simulate_one_path, payloads):
+                    population_sum += pop
+                    population_sq_sum += pop ** 2
 
-def compute_stokes_block(
-    n: int,
-    m: int,
-    n1: int,
-    n2: int,
-    filepath: str,
-    intensity: float,
-    dt: float,
-    fwhm: float,
-    omega_x: float,
-    omega_o: float,
-    time_span: float,
-    lambda_val: float,
-    lambda_pairs: tuple[tuple[float, float], ...],
-    initial_conditions,
-    propagation_method: str,
-) -> tuple[int, int, np.ndarray]:
-    """Compute the Stokes-response block for one ``(n, m)`` grid point.
+        population_average = population_sum / self.n_paths
 
-    Parameters
-    ----------
-    n, m : int
-        Grid indices along optical and X-ray phase directions.
-    n1, n2 : int
-        Grid sizes used to evaluate ``phase_o`` and ``phase_x``.
-    filepath : str
-        Directory containing ``ci_mut.inp`` and ``ci_energy.inp``.
-    intensity, dt, fwhm, omega_x, omega_o, time_span : float
-        Pulse and propagation parameters passed to ``ElectricFieldPulse``.
-    lambda_val : float
-        Amplitude used in the finite-difference Stokes extraction.
-    lambda_pairs : tuple of (float, float)
-        ``(lambda_x, lambda_o)`` combinations to combine.
-    initial_conditions
-        Initial-state specification accepted by ``SSE``.
-    propagation_method : str
-        Integrator passed to ``SSE``.
+        if self.n_paths > 1:
+            variance = (population_sq_sum - population_sum ** 2 / self.n_paths) / (self.n_paths - 1)
+            variance = np.maximum(variance, 0.0)
+            population_std = np.sqrt(variance)#/np.sqrt(self.n_paths)
+        else:
+            population_std = np.zeros((n_t, n_s), dtype=float)
 
-    Returns
-    -------
-    tuple of (int, int, numpy.ndarray)
-        Grid indices and array with shape ``(3, n_time)``.
-    """
-    from pysse.class_field import ElectricFieldPulse
-
-    phase_o = 2 * np.pi * n / n1
-    phase_x = 2 * np.pi * m / n2
-    field_x_nm = ElectricFieldPulse(
-        intensity=intensity,
-        dt=dt,
-        pulse_type="gaussian_sin",
-        fwhm=fwhm,
-        omega_sin=omega_x,
-        phase_sin=phase_x,
-        time_span=time_span,
-    )
-    field_o_nm = ElectricFieldPulse(
-        intensity=intensity,
-        dt=dt,
-        pulse_type="gaussian_sin",
-        fwhm=fwhm,
-        omega_sin=omega_o,
-        phase_sin=phase_o,
-        time_span=time_span,
-    )
-    pulse_z = np.zeros_like(field_x_nm.pulse)
-    mu_block = np.zeros((3, len(field_x_nm.time)), dtype=np.complex128)
-
-    for lambda_x, lambda_o in lambda_pairs:
-        electric_field = {
-            "time": field_x_nm.time,
-            "pulse_x": lambda_o * field_o_nm.pulse,
-            "pulse_y": lambda_x * field_x_nm.pulse,
-            "pulse_z": pulse_z,
-        }
-        sse = SSE(filepath, electric_field, initial_conditions, propagation_method)
-        sign = lambda_x * lambda_o
-        mu_block += sign * sse.mu_t / (4 * lambda_val**2)
-
-    return n, m, mu_block
-
-
-def fill_stokes_grid(
-    stokes_grid: np.ndarray,
-    *,
-    n1: int,
-    n2: int,
-    filepath: str,
-    intensity: float,
-    dt: float,
-    fwhm: float,
-    omega_x: float,
-    omega_o: float,
-    time_span: float,
-    lambda_val: float,
-    lambda_configs: dict[str, tuple[float, float]],
-    initial_conditions,
-    propagation_method: str,
-    n_jobs: int = 1,
-    src_path: str | None = None,
-) -> None:
-    """Fill ``stokes_grid[n, m]`` in place, optionally in parallel over ``(n, m)``.
-
-    Parameters
-    ----------
-    stokes_grid : numpy.ndarray
-        Array with shape ``(n1, n2, 3, n_time)`` to fill in place.
-    n_jobs : int, optional
-        Number of worker processes. ``1`` runs serially; ``-1`` uses all CPUs.
-    src_path : str | None, optional
-        Path to the ``src`` directory. Required in notebooks when ``pysse`` is
-        loaded via ``sys.path`` and ``n_jobs != 1``.
-    """
-    lambda_pairs = tuple(lambda_configs.values())
-    tasks = [(n, m) for n in range(n1) for m in range(n2)]
-
-    common_kwargs = dict(
-        n1=n1,
-        n2=n2,
-        filepath=filepath,
-        intensity=intensity,
-        dt=dt,
-        fwhm=fwhm,
-        omega_x=omega_x,
-        omega_o=omega_o,
-        time_span=time_span,
-        lambda_val=lambda_val,
-        lambda_pairs=lambda_pairs,
-        initial_conditions=initial_conditions,
-        propagation_method=propagation_method,
-    )
-
-    if n_jobs == 1:
-        for n, m in tasks:
-            _, _, block = compute_stokes_block(n, m, **common_kwargs)
-            stokes_grid[n, m] = block
-        return
-
-    workers = os.cpu_count() if n_jobs < 0 else n_jobs
-    with ProcessPoolExecutor(
-        max_workers=workers,
-        initializer=_init_parallel_worker,
-        initargs=(src_path,),
-    ) as executor:
-        futures = [
-            executor.submit(compute_stokes_block, n, m, **common_kwargs)
-            for n, m in tasks
-        ]
-        for future in futures:
-            n, m, block = future.result()
-            stokes_grid[n, m] = block
+        return population_average, population_std
